@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/JanFalkin/tantivy-jpc/go-client/tantivy"
 )
@@ -18,8 +20,13 @@ limbs and branches that arch over the pool`
 const oldMan = "He was an old man who fished alone in a skiff in the Gulf Stream and he had gone eighty-four days now without taking a fish."
 
 func doRun() {
-	tantivy.LibInit("debug")
-	builder, err := tantivy.NewBuilder("")
+	tantivy.LibInit("info")
+	tmpDir, err := os.MkdirTemp("", "tantivy-vector-sync*")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	builder, err := tantivy.NewBuilder(tmpDir)
 	if err != nil {
 		panic(err)
 	}
@@ -27,7 +34,7 @@ func doRun() {
 	if err != nil {
 		panic(err)
 	}
-	idxFieldBody, err := builder.AddTextField("body", tantivy.TEXT, false, true, "", false)
+	idxFieldBody, err := builder.AddTextField("body", tantivy.TEXT, true, true, "", false)
 	if err != nil {
 		panic(err)
 	}
@@ -41,20 +48,24 @@ func doRun() {
 	if err != nil {
 		panic(err)
 	}
-	doc1, err := doc.Create()
-	if err != nil {
-		panic(err)
+	bodySeed := strings.Repeat(ofMiceAndMen+" ", 24)
+	for i := 0; i < 12; i++ {
+		docID, err := doc.Create()
+		if err != nil {
+			panic(err)
+		}
+		title := fmt.Sprintf("Vector Candidate %02d", i)
+		body := fmt.Sprintf("vector-sync-%02d %s %s", i, oldMan, bodySeed)
+		if _, err = doc.AddText(idxFieldTitle, title, docID); err != nil {
+			panic(err)
+		}
+		if _, err = doc.AddText(idxFieldBody, body, docID); err != nil {
+			panic(err)
+		}
+		if _, err = doc.AddInt(idxFieldOrder, int64(1000+i), docID); err != nil {
+			panic(err)
+		}
 	}
-	doc2, err := doc.Create()
-	if err != nil {
-		panic(err)
-	}
-	doc.AddText(idxFieldTitle, "The Old Man and the Sea", doc1)
-	doc.AddText(idxFieldBody, oldMan, doc1)
-	doc.AddInt(idxFieldOrder, 111, doc1)
-	doc.AddText(idxFieldTitle, "Of Mice and Men", doc2)
-	doc.AddText(idxFieldBody, ofMiceAndMen, doc2)
-	doc.AddInt(idxFieldOrder, 222, doc2)
 
 	idx, err := doc.CreateIndex()
 	if err != nil {
@@ -69,13 +80,10 @@ func doRun() {
 	if err != nil {
 		panic(err)
 	}
-	_, err = idw.AddDocument(doc1)
-	if err != nil {
-		panic(err)
-	}
-	_, err = idw.AddDocument(doc2)
-	if err != nil {
-		panic(err)
+	for docID := uint(1); docID <= 12; docID++ {
+		if _, err = idw.AddDocument(docID); err != nil {
+			panic(err)
+		}
 	}
 
 	_, err = idw.Commit()
@@ -93,52 +101,54 @@ func doRun() {
 		panic(err)
 	}
 
-	_, err = qp.ForIndex([]string{"title", "body"})
+	_, err = qp.ForIndex([]string{"title", "body", "order"})
 	if err != nil {
 		panic(err)
 	}
 
-	searcher, err := qp.ParseQuery("order:111")
+	searcher, err := qp.ParseQuery("body:vector-sync")
+	if err != nil {
+		panic(err)
+	}
+	docsetJSON, err := searcher.DocsetAll(true, 0)
+	if err != nil {
+		panic(err)
+	}
+	var refs struct {
+		Docset []tantivy.SearchResultRef `json:"docset"`
+	}
+	if err = json.Unmarshal([]byte(docsetJSON), &refs); err != nil {
+		panic(err)
+	}
+
+	vectorSyncJSON, err := searcher.GetDocumentsWithOptions(refs.Docset, tantivy.GetDocumentsOptions{
+		SelectFields: []string{"title", "order"},
+	})
+	if err != nil {
+		panic(err)
+	}
+	batchedJSON, err := searcher.SearchWithOptionsBatched(tantivy.SearchOptions{
+		Ordered:      true,
+		SelectFields: []string{"title", "order"},
+	}, 4)
 	if err != nil {
 		panic(err)
 	}
 
-	var sr []map[string]interface{}
-
-	s, err := searcher.Search(false, 0, 0, true)
-	if err != nil {
+	var projected []map[string]interface{}
+	if err = json.Unmarshal([]byte(vectorSyncJSON), &projected); err != nil {
+		panic(err)
+	}
+	var batched []map[string]interface{}
+	if err = json.Unmarshal([]byte(batchedJSON), &batched); err != nil {
 		panic(err)
 	}
 
-	err = json.Unmarshal([]byte(s), &sr)
-	if err != nil {
-		panic(err)
-	}
-	if sr[0]["doc"].(map[string]interface{})["title"].([]interface{})[0] != "The Old Man and the Sea" {
-		panic("expected value not received")
-	}
-	if err != nil {
-		panic(err)
-	}
-	searcherAgain, err := qp.ParseQuery("order:222")
-	if err != nil {
-		panic(err)
-	}
-	s, err = searcherAgain.Search(false, 0, 0, true)
-	if err != nil {
-		panic(err)
-	}
-	err = json.Unmarshal([]byte(s), &sr)
-	if err != nil {
-		panic(err)
-	}
-
-	if sr[0]["doc"].(map[string]interface{})["title"].([]interface{})[0] != "Of Mice and Men" {
-		panic("expected value not received")
-	}
+	fmt.Printf("vector-sync refs=%d hydrated=%d direct-bytes=%d batched-bytes=%d\n", len(refs.Docset), len(projected), len(vectorSyncJSON), len(batchedJSON))
+	fmt.Printf("first hydrated doc: %s\n", projected[0]["doc"].(map[string]interface{})["title"].([]interface{})[0])
 
 	tantivy.ClearSession(builder.ID())
-	fmt.Println("It worked!!!")
+	fmt.Println("vector sync demo complete")
 
 }
 

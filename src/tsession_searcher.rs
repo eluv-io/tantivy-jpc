@@ -3,7 +3,6 @@ use crate::make_internal_json_error;
 use crate::ErrorKinds;
 use crate::InternalCallResult;
 use crate::TantivySession;
-use base64::Engine;
 use tantivy::DocAddress;
 use tantivy::Searcher;
 use tantivy::TERMINATED;
@@ -12,7 +11,6 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 use crate::HashMap;
-use base64::engine::general_purpose;
 use log::error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -182,6 +180,38 @@ pub struct ResultElementDoc {
 }
 
 impl TantivySession {
+    fn extract_string_array(params: &serde_json::Value, key: &str) -> Vec<String> {
+        params
+            .as_object()
+            .and_then(|p| p.get(key))
+            .and_then(|u| u.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn project_named_doc(
+        &self,
+        named_doc: NamedFieldDocument,
+        select_fields: &[String],
+    ) -> NamedFieldDocument {
+        if select_fields.is_empty() {
+            return named_doc;
+        }
+
+        let mut projected = BTreeMap::<String, Vec<Value>>::new();
+        for field_name in select_fields {
+            if let Some(values) = named_doc.0.get(field_name) {
+                projected.insert(field_name.clone(), values.clone());
+            }
+        }
+
+        NamedFieldDocument(projected)
+    }
+
     pub fn handle_fuzzy_searcher(
         &mut self,
         method: &str,
@@ -303,6 +333,56 @@ impl TantivySession {
         }
     }
 
+    fn resolve_top_limit(searcher: &Searcher, top_limit: u64, offset: usize) -> u64 {
+        if top_limit == 0 {
+            searcher.num_docs().saturating_sub(offset as u64)
+        } else {
+            top_limit
+        }
+    }
+
+    fn build_result_element(
+        &self,
+        searcher: &Searcher,
+        query: &dyn Query,
+        doc_address: DocAddress,
+        score: f32,
+        explain: bool,
+        snippet_fields: &[String],
+        select_fields: &[String],
+    ) -> Result<ResultElement, ErrorKinds> {
+        let retrieved_doc = searcher.doc(doc_address)?;
+        let schema = self
+            .schema
+            .as_ref()
+            .ok_or_else(|| ErrorKinds::NotExist("Schema not present".to_string()))?;
+        let named_doc = self.project_named_doc(schema.to_named_doc(&retrieved_doc), select_fields);
+        let mut explanation = "noexplain".to_string();
+        if explain {
+            explanation = query.explain(searcher, doc_address)?.to_pretty_json();
+        }
+
+        let mut snippet_html: HashMap<String, String> = HashMap::new();
+        snippet_fields.iter().for_each(|field_name| {
+            if !field_name.is_empty() {
+                let snippet = match self.make_snippet(field_name, searcher, query, &retrieved_doc) {
+                    Ok(value) => (field_name.as_str(), value),
+                    Err(err) => ("", err.to_string()),
+                };
+                if !snippet.0.is_empty() {
+                    snippet_html.insert(snippet.0.to_string(), snippet.1);
+                }
+            }
+        });
+
+        Ok(ResultElement {
+            doc: named_doc,
+            score,
+            explain: explanation,
+            snippet_html: Some(snippet_html),
+        })
+    }
+
     fn do_docset(&mut self, params: serde_json::Value) -> InternalCallResult<u32> {
         const DEF_LIMIT: u64 = 10;
         let (top_limit, offset, score) = match params.as_object() {
@@ -316,6 +396,7 @@ impl TantivySession {
             None => (DEF_LIMIT, 0, true),
         };
         let (query, idx, searcher) = self.setup_searcher()?;
+        let top_limit = Self::resolve_top_limit(&searcher, top_limit, offset);
 
         let td = self.do_search_execute(&searcher, query, idx, offset, top_limit, score)?;
         debug!("search complete len = {}, td = {:?}", td.len(), td);
@@ -357,22 +438,16 @@ impl TantivySession {
     }
 
     fn do_get_document(&mut self, params: serde_json::Value) -> InternalCallResult<u32> {
-        let (segment_ord, doc_id, score, explain, fields) = match params.as_object() {
+        let snippet_fields = Self::extract_string_array(&params, "snippet_field");
+        let select_fields = Self::extract_string_array(&params, "select_fields");
+        let (segment_ord, doc_id, score, explain) = match params.as_object() {
             Some(p) => (
                 (p.get("segment_ord").and_then(|u| u.as_u64()).unwrap_or(0)) as u32,
                 (p.get("doc_id").and_then(|u| u.as_u64()).unwrap_or(0)) as u32,
                 (p.get("score").and_then(|u| u.as_f64()).unwrap_or(0.0)),
                 p.get("explain").and_then(|u| u.as_bool()).unwrap_or(false),
-                p.get("snippet_field")
-                    .and_then(|u| u.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| item.as_str())
-                            .collect::<Vec<&str>>()
-                    })
-                    .unwrap_or_else(Vec::new), // Default to an empty vector
             ),
-            None => (0, 0, 0.0, false, vec![]), // Default values
+            None => (0, 0, 0.0, false),
         };
 
         let doc_address = DocAddress {
@@ -381,45 +456,75 @@ impl TantivySession {
         };
         let (query, _idx, searcher) = self.setup_searcher()?;
 
-        let retrieved_doc = searcher.doc(doc_address)?;
-        let schema = self
-            .schema
-            .as_ref()
-            .ok_or_else(|| ErrorKinds::NotExist("Schema not present".to_string()))?;
-        let named_doc = schema.to_named_doc(&retrieved_doc);
-        let mut s: String = "noexplain".to_string();
-        if explain {
-            s = query.explain(&searcher, doc_address)?.to_pretty_json();
-        }
-        debug!("retrieved doc {:?}", retrieved_doc.field_values());
-
-        let mut hm: HashMap<String, String> = HashMap::new();
-
-        fields.iter().for_each(|&v| {
-            if !v.is_empty() {
-                let e = match self.make_snippet(v, &searcher, query, &retrieved_doc) {
-                    Ok(g) => (v, g),
-                    Err(e) => ("", e.to_string()),
-                };
-                if !e.0.is_empty() {
-                    hm.insert(e.0.to_string(), e.1);
-                }
-            }
-        });
-
-        let re = ResultElement {
-            doc: named_doc,
-            score: score as f32,
-            explain: s,
-            snippet_html: Some(hm),
-        };
+        let re = self.build_result_element(
+            &searcher,
+            query,
+            doc_address,
+            score as f32,
+            explain,
+            &snippet_fields,
+            &select_fields,
+        )?;
         self.return_buffer = serde_json::to_string(&re)?;
+        Ok(0)
+    }
+
+    fn do_get_documents(&mut self, params: serde_json::Value) -> InternalCallResult<u32> {
+        let snippet_fields = Self::extract_string_array(&params, "snippet_field");
+        let select_fields = Self::extract_string_array(&params, "select_fields");
+        let explain = params
+            .as_object()
+            .and_then(|p| p.get("explain"))
+            .and_then(|u| u.as_bool())
+            .unwrap_or(false);
+        let docs = params
+            .as_object()
+            .and_then(|p| p.get("docs"))
+            .and_then(|u| u.as_array())
+            .ok_or_else(|| ErrorKinds::BadParams("parameter 'docs' missing".to_string()))?;
+
+        let (query, _idx, searcher) = self.setup_searcher()?;
+        let mut results = Vec::<ResultElement>::with_capacity(docs.len());
+
+        for doc in docs {
+            let doc_obj = doc
+                .as_object()
+                .ok_or_else(|| ErrorKinds::BadParams("doc reference must be an object".to_string()))?;
+            let doc_address = DocAddress {
+                doc_id: doc_obj
+                    .get("doc_id")
+                    .and_then(|u| u.as_u64())
+                    .unwrap_or(0) as u32,
+                segment_ord: doc_obj
+                    .get("segment_ord")
+                    .and_then(|u| u.as_u64())
+                    .unwrap_or(0) as u32,
+            };
+            let score = doc_obj
+                .get("score")
+                .and_then(|u| u.as_f64())
+                .unwrap_or(0.0) as f32;
+
+            results.push(self.build_result_element(
+                &searcher,
+                query,
+                doc_address,
+                score,
+                explain,
+                &snippet_fields,
+                &select_fields,
+            )?);
+        }
+
+        self.return_buffer = serde_json::to_string(&results)?;
         Ok(0)
     }
 
     fn do_search(&mut self, params: serde_json::Value) -> InternalCallResult<u32> {
         const DEF_LIMIT: u64 = 10;
-        let (top_limit, offset, explain, score, fields) = match params.as_object() {
+        let snippet_fields = Self::extract_string_array(&params, "snippet_field");
+        let select_fields = Self::extract_string_array(&params, "select_fields");
+        let (top_limit, offset, explain, score) = match params.as_object() {
             Some(p) => (
                 p.get("top_limit")
                     .and_then(|u| u.as_u64())
@@ -427,58 +532,27 @@ impl TantivySession {
                 p.get("offset").and_then(|u| u.as_u64()).unwrap_or(0) as usize,
                 p.get("explain").and_then(|u| u.as_bool()).unwrap_or(false),
                 p.get("scoring").and_then(|u| u.as_bool()).unwrap_or(true),
-                p.get("snippet_field")
-                    .and_then(|u| u.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| item.as_str())
-                            .collect::<Vec<&str>>()
-                    })
-                    .unwrap_or_else(Vec::new), // Default to an empty vector
             ),
-            None => (DEF_LIMIT, 0, false, true, vec![]),
+            None => (DEF_LIMIT, 0, false, true),
         };
         let (query, idx, searcher) = self.setup_searcher()?;
+        let top_limit = Self::resolve_top_limit(&searcher, top_limit, offset);
 
         let td = self.do_search_execute(&searcher, query, idx, offset, top_limit, score)?;
-
-        let snippets = !fields.is_empty();
-
-        let mut hm = HashMap::new();
 
         debug!("search complete len = {}, td = {:?}", td.len(), td);
         let mut vret: Vec<ResultElement> = Vec::<ResultElement>::new();
         for (score, doc_address) in td {
-            let retrieved_doc = searcher.doc(doc_address)?;
-            let schema = self
-                .schema
-                .as_ref()
-                .ok_or_else(|| ErrorKinds::NotExist("Schema not present".to_string()))?;
-            let named_doc = schema.to_named_doc(&retrieved_doc);
-            let mut s: String = "noexplain".to_string();
-            if explain {
-                s = query.explain(&searcher, doc_address)?.to_pretty_json();
-            }
-            if snippets {
-                fields.iter().for_each(|&v| {
-                    if !v.is_empty() {
-                        let e = match self.make_snippet(v, &searcher, query, &retrieved_doc) {
-                            Ok(g) => (v, g),
-                            Err(e) => ("", e.to_string()),
-                        };
-                        if !e.0.is_empty() {
-                            hm.insert(e.0.to_string(), e.1);
-                        }
-                    }
-                });
-            }
-            debug!("retrieved doc {:?}", retrieved_doc.field_values());
-            vret.append(&mut vec![ResultElement {
-                doc: named_doc,
+            let result = self.build_result_element(
+                &searcher,
+                query,
+                doc_address,
                 score,
-                explain: s,
-                snippet_html: Some(hm.clone()),
-            }]);
+                explain,
+                &snippet_fields,
+                &select_fields,
+            )?;
+            vret.push(result);
         }
         self.return_buffer = serde_json::to_string(&vret)?;
         debug!("ret = {}", self.return_buffer);
@@ -552,13 +626,12 @@ impl TantivySession {
         params: serde_json::Value,
     ) -> InternalCallResult<u32> {
         debug!("Searcher");
-        let s = format!("{}", params);
-        println!("{}", s);
         match method {
             "search" => self.do_search(params),
             "search_raw" => self.do_raw_search(params),
             "docset" => self.do_docset(params),
             "get_document" => self.do_get_document(params),
+            "get_documents" => self.do_get_documents(params),
             _ => {
                 error!("unknown method {method}");
                 Err(ErrorKinds::NotExist(format!("unknown method {method}")))
