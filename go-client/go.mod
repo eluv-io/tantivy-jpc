@@ -1,8 +1,8 @@
-module github.com/JanFalkin/tantivy-jpc/go-client
+module github.com/eluv-io/tantivy-jpc/go-client
 
 go 1.17
 
-replace github.com/JanFalkin/tantivy-jpc/go-client/tantivy => ./go-client/tantivy
+replace github.com/eluv-io/tantivy-jpc/go-client/tantivy => ./go-client/tantivy
 
 require (
 	github.com/eluv-io/errors-go v1.0.0
