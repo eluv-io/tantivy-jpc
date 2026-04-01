@@ -30,6 +30,7 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v8
         with:
+          token: ${{ secrets.PR_CREATOR_TOKEN }}
           commit-message: update linux binary
           title: Update libtantivy_jpc.a
           body: Credit new contributors by updating libtantivy_jpc.a
@@ -62,6 +63,7 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v8
         with:
+          token: ${{ secrets.PR_CREATOR_TOKEN }}
           commit-message: update darwin aarch lib
           title: Update libtantivy_jpc.a
           body: Credit new contributors by updating libtantivy_jpc.a
