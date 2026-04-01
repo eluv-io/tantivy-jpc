@@ -12,6 +12,8 @@ package tantivy
 import "C"
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"os"
 	"sync"
 	"unsafe"
@@ -58,6 +60,19 @@ func (j *JPCId) ID() string {
 	return j.id
 }
 
+func readResponseBuffer(ptr *C.uchar, length C.uintptr_t) ([]byte, error) {
+	if ptr == nil {
+		if length == 0 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("tantivy_jpc returned a nil buffer with length %d", uint64(length))
+	}
+	if uint64(length) > uint64(math.MaxInt32) {
+		return nil, fmt.Errorf("tantivy_jpc returned %d bytes, exceeding the Go cgo byte limit", uint64(length))
+	}
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(length)), nil
+}
+
 func (jpc *JPCId) callTantivy(object, method string, params msi) (string, error) {
 	f := map[string]interface{}{
 		"id":     jpc.id,
@@ -70,22 +85,26 @@ func (jpc *JPCId) callTantivy(object, method string, params msi) (string, error)
 	if err != nil {
 		return "", err
 	}
-	var pcomsBuf *C.char
-	var blen int64
 	sb := string(b)
 	pcJPCParams := C.CString(sb)
-	pCDesctination := (*C.uchar)(unsafe.Pointer(pcomsBuf))
+	defer C.free(unsafe.Pointer(pcJPCParams))
+	var pCDesctination *C.uchar
+	var blen C.uintptr_t
 	cJPCParams := (*C.uchar)(unsafe.Pointer(pcJPCParams))
-	pDestinationLen := (*C.ulong)(unsafe.Pointer(&blen))
-	ttret := C.tantivy_jpc(cJPCParams, C.ulong(uint64(len(sb))), &pCDesctination, pDestinationLen)
-	if ttret < 0 {
-		return "", errors.E("Tantivy JPC Failed", errors.K.Invalid, "desc", string(C.GoBytes(unsafe.Pointer(pCDesctination), C.int(*pDestinationLen))))
+	ttret := C.tantivy_jpc(cJPCParams, C.uintptr_t(len(sb)), &pCDesctination, &blen)
+	if ttret >= 0 {
+		defer C.free_data(ttret)
 	}
-	defer func() {
-		if ttret >= 0 {
-			C.free_data(ttret)
+	returnBytes, readErr := readResponseBuffer(pCDesctination, blen)
+	if ttret < 0 {
+		if readErr != nil {
+			return "", errors.E("Tantivy JPC Failed", errors.K.Invalid, "desc", readErr.Error())
 		}
-	}()
-	returnData := string(C.GoBytes(unsafe.Pointer(pCDesctination), C.int(*pDestinationLen)))
+		return "", errors.E("Tantivy JPC Failed", errors.K.Invalid, "desc", string(returnBytes))
+	}
+	if readErr != nil {
+		return "", errors.E("Tantivy JPC Failed", errors.K.Invalid, "desc", readErr.Error())
+	}
+	returnData := string(returnBytes)
 	return returnData, nil
 }

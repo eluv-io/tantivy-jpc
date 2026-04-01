@@ -171,3 +171,52 @@ func main() {
 ```
 
 ```
+
+## Choosing a Search Path
+
+Use `Search()` when the result set is modest and you want Tantivy to return the full stored document payload in one response.
+
+Use `SearchWithOptions()` when the match set still fits in one response but the caller only needs a subset of fields. Passing `SelectFields` cuts the JSON payload substantially and is the fastest option when a single response is still safe.
+
+Use `DocsetAll()` plus `GetDocumentsWithOptions()` when the caller must see the full match set before its own filtering or pagination, but should only hydrate selected fields. This is a good fit for vector-index sync and permission-filtering flows.
+
+Use `SearchWithOptionsBatched()` when the result set is too large to safely move across the Go/Rust boundary in one payload. It fetches all matching document references first, then hydrates selected fields in bounded batches and returns a single aggregated JSON array to the caller.
+
+Typical vector-sync pattern:
+
+```go
+docsetJSON, err := searcher.DocsetAll(true, 0)
+if err != nil {
+    panic(err)
+}
+
+var refs struct {
+    Docset []tantivy.SearchResultRef `json:"docset"`
+}
+if err := json.Unmarshal([]byte(docsetJSON), &refs); err != nil {
+    panic(err)
+}
+
+docsJSON, err := searcher.GetDocumentsWithOptions(refs.Docset, tantivy.GetDocumentsOptions{
+    SelectFields: []string{"title", "order"},
+})
+if err != nil {
+    panic(err)
+}
+
+_ = docsJSON
+```
+
+If you do not need explicit control over batching, the equivalent one-call helper is:
+
+```go
+docsJSON, err := searcher.SearchWithOptionsBatched(tantivy.SearchOptions{
+    Ordered:      true,
+    SelectFields: []string{"title", "order"},
+}, 256)
+if err != nil {
+    panic(err)
+}
+
+_ = docsJSON
+```
