@@ -28,7 +28,7 @@ cargo nightly build --release
 ### Via go get
 
 ```sh
-go get github.com/JanFalkin/tantivy-jpc/go-client/tantivy
+go get github.com/eluv-io/tantivy-jpc/go-client/tantivy
 
 ```
 
@@ -42,7 +42,7 @@ import (
  "io/ioutil"
  "os"
 
- "github.com/JanFalkin/tantivy-jpc/go-client/tantivy"
+ "github.com/eluv-io/tantivy-jpc/go-client/tantivy"
 )
 
 const ofMiceAndMen = `A few miles south of Soledad, the Salinas River drops in close to the hillside
